@@ -1,9 +1,9 @@
 import io
 import os
 import re
-import time
 import zipfile
 import mimetypes
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from urllib.parse import urlparse, unquote
 
 import pandas as pd
@@ -108,12 +108,25 @@ def choose_value(row_map, candidates, default=""):
 
 
 def row_metadata(row_map, sheet_name):
-    subject = choose_value(row_map, ["subject", "category", "topic", "course", "department"], sheet_name)
-    title = choose_value(row_map, ["title", "name", "exam", "resource", "document", "source"], "Untitled")
+    subject = choose_value(row_map, ["subject", "category", "topic", "course", "department"], "")
+    title = choose_value(row_map, ["title", "name", "exam", "resource", "document", "source", "book"], "")
     year = choose_value(row_map, ["year", "date", "session", "term"], "Unspecified")
     level = choose_value(row_map, ["grade", "class", "level", "board", "standard"], "")
     notes = choose_value(row_map, ["notes", "status", "description", "remarks"], "")
-    return subject, title, year, level, notes
+
+    # Headerless workbook fallback. For rows such as:
+    # XII | Economics | Introductory Microeconomics | https://...
+    # use the second value as Subject and the third as Book/Title.
+    ordered_values = [clean_text(v) for v in row_map.values()]
+    non_url_values = [v for v in ordered_values if v and not extract_urls_from_text(v)]
+    if not subject:
+        subject = non_url_values[1] if len(non_url_values) >= 2 else (non_url_values[0] if non_url_values else sheet_name)
+    if not title:
+        title = non_url_values[2] if len(non_url_values) >= 3 else (non_url_values[-1] if non_url_values else "Untitled")
+    if not level and non_url_values:
+        level = non_url_values[0]
+
+    return subject or sheet_name, title or "Untitled", year, level, notes
 
 
 def extract_hyperlinks(excel_bytes):
@@ -254,7 +267,7 @@ def download_file(item):
         response.raise_for_status()
         content_type = response.headers.get("Content-Type", "")
         disposition = response.headers.get("Content-Disposition", "")
-        return {**item, "Status": "Success", "Filename": build_filename(item, content_type, disposition), "Error": "", "Content": response.content}
+        return {**item, "Status": "Success", "Filename": build_filename(item, content_type, disposition), "Content Type": content_type, "Error": "", "Content": response.content}
     except requests.exceptions.RequestException as exc:
         return {**item, "Status": "Failed", "Filename": "", "Error": str(exc), "Content": None}
 
@@ -305,35 +318,79 @@ def extract_text_from_pdf(content):
         return f"Text extraction failed: {exc}"
 
 
+def is_zip_download(item):
+    filename = clean_text(item.get("Filename", "")).lower()
+    content_type = clean_text(item.get("Content Type", "")).lower()
+    return filename.endswith(".zip") or "application/zip" in content_type or "x-zip" in content_type
+
+
+def archive_stem(item):
+    url_name = os.path.basename(urlparse(item.get("URL", "")).path)
+    stem = os.path.splitext(unquote(url_name))[0]
+    return make_safe_filename(stem or item.get("Title / Source") or "Book")
+
+
+def book_folder_name(item):
+    title = clean_text(item.get("Title / Source", ""))
+    if title and title.lower() not in {"untitled", "file"}:
+        return make_safe_filename(title)
+    return archive_stem(item)
+
+
+def add_download_to_master_zip(zf, used_paths, item):
+    """Add a direct file or flatten a downloaded ZIP into Subject/Book/."""
+    subject = make_safe_filename(item.get("Subject / Category") or "General")
+    book = book_folder_name(item)
+    base_folder = f"{subject}/{book}"
+    content = item.get("Content")
+
+    if is_zip_download(item):
+        try:
+            with zipfile.ZipFile(io.BytesIO(content), "r") as source_zip:
+                extracted = 0
+                for member in source_zip.infolist():
+                    if member.is_dir():
+                        continue
+                    # Ignore archive-internal folders and place every actual file
+                    # directly under Subject/Book/.
+                    member_name = make_safe_filename(os.path.basename(member.filename))
+                    if not member_name:
+                        continue
+                    member_content = source_zip.read(member)
+                    final_path = add_file_to_zip(
+                        zf, used_paths, f"{base_folder}/{member_name}", member_content
+                    )
+                    extracted += 1
+                if extracted:
+                    item["Zip Path"] = f"{base_folder}/ ({extracted} extracted files)"
+                    return
+        except (zipfile.BadZipFile, RuntimeError, OSError) as exc:
+            item["Archive Warning"] = f"Could not extract ZIP; saved original archive: {exc}"
+
+    item["Zip Path"] = add_file_to_zip(
+        zf, used_paths, f"{base_folder}/{item['Filename']}", content
+    )
+
+
 def create_zip(results, include_originals=True, include_merged=False, include_text=False):
-    """Create exactly one master ZIP containing all downloaded files."""
+    """Create one master ZIP arranged as Subject / Book / actual files."""
     output, used_paths = io.BytesIO(), set()
     successful = [r for r in results if r.get("Status") == "Success" and r.get("Content")]
-    root_folder = "All_Downloads"
 
     with zipfile.ZipFile(output, "w", zipfile.ZIP_DEFLATED, allowZip64=True) as zf:
-        # One report for the entire download batch.
-        zf.writestr(f"{root_folder}/download_report.xlsx", create_report_excel(results))
+        # Keep the batch report at the ZIP root.
+        zf.writestr("download_report.xlsx", create_report_excel(results))
 
         if include_originals:
             for item in successful:
-                subject = make_safe_filename(item.get("Subject / Category") or "General")
-                year = make_safe_filename(item.get("Year / Date") or "Unspecified")
-                title = make_safe_filename(item.get("Title / Source") or "Untitled")
-                file_type = make_safe_filename(item.get("File Type") or "File")
-
-                # Master ZIP structure:
-                # All_Downloads / Subject / Year / Title / File Type / file
-                path = f"{root_folder}/{subject}/{year}/{title}/{file_type}/{item['Filename']}"
-                item["Zip Path"] = add_file_to_zip(zf, used_paths, path, item["Content"])
+                add_download_to_master_zip(zf, used_paths, item)
 
         if include_text:
             for item in successful:
                 if item.get("Filename", "").lower().endswith(".pdf"):
                     subject = make_safe_filename(item.get("Subject / Category") or "General")
-                    year = make_safe_filename(item.get("Year / Date") or "Unspecified")
-                    title = make_safe_filename(item.get("Title / Source") or "Untitled")
-                    path = f"{root_folder}/Text_Extracted/{subject}/{year}/{title}.txt"
+                    base_name = os.path.splitext(item["Filename"])[0]
+                    path = f"{subject}/{base_name}_text.txt"
                     add_file_to_zip(
                         zf,
                         used_paths,
@@ -342,28 +399,22 @@ def create_zip(results, include_originals=True, include_merged=False, include_te
                     )
 
         if include_merged:
-            groups = sorted({
-                (
-                    item.get("Subject / Category") or "General",
-                    item.get("Year / Date") or "Unspecified",
-                )
-                for item in successful
-            })
-            for subject, year in groups:
+            subjects = sorted({item.get("Subject / Category") or "General" for item in successful})
+            for subject in subjects:
                 items = [
                     item for item in successful
                     if (item.get("Subject / Category") or "General") == subject
-                    and (item.get("Year / Date") or "Unspecified") == year
                     and item.get("Filename", "").lower().endswith(".pdf")
                 ]
                 merged = merge_pdfs(items)
                 if merged:
-                    merged_path = (
-                        f"{root_folder}/Merged_PDFs/"
-                        f"{make_safe_filename(subject)}/{make_safe_filename(year)}/"
-                        f"{make_safe_filename(subject)}_{make_safe_filename(year)}_merged.pdf"
+                    safe_subject = make_safe_filename(subject)
+                    add_file_to_zip(
+                        zf,
+                        used_paths,
+                        f"{safe_subject}/{safe_subject}_merged.pdf",
+                        merged,
                     )
-                    add_file_to_zip(zf, used_paths, merged_path, merged)
 
     output.seek(0)
     return output.getvalue()
@@ -375,15 +426,16 @@ def main():
     st.write(
         "Upload one or more Excel workbooks containing links. The app reads every sheet and row, "
         "automatically identifies subjects, categories, titles, years, file types, and hidden Excel hyperlinks, "
-        "then downloads every selected file into one master ZIP organized by subject, year, title, and file type."
+        "then creates one master ZIP arranged as Subject / Book Title / extracted files. Downloaded ZIP packages are automatically unpacked, and their internal folders are flattened."
     )
 
     with st.sidebar:
         st.header("Master ZIP Options")
         include_originals = st.checkbox("Original downloaded files", True)
-        include_merged = st.checkbox("Merge PDFs by subject and year", False)
+        include_merged = st.checkbox("Merge direct PDFs by subject", False)
         include_text = st.checkbox("Extract text from PDFs", False)
         show_debug = st.checkbox("Show detection details", False)
+        max_workers = st.slider("Parallel downloads", min_value=2, max_value=16, value=8, help="Higher values can be faster, but some websites may throttle or block too many simultaneous requests.")
 
     uploaded_files = st.file_uploader(
         "Upload one or more Excel workbooks",
@@ -475,20 +527,42 @@ def main():
         return
 
     if st.button("⬇️ Build One Master ZIP", type="primary"):
-        records, results = filtered.to_dict("records"), []
+        records = filtered.to_dict("records")
+        results = [None] * len(records)
         progress, status = st.progress(0), st.empty()
-        for index, item in enumerate(records, 1):
-            status.write(f"Downloading {index}/{len(records)}: {item['Title / Source']} — {item['File Type']}")
-            results.append(download_file(item))
-            progress.progress(index / len(records))
-            time.sleep(0.03)
+
+        # Download several independent URLs at the same time. Threading is
+        # effective here because network waiting, not Python computation, is
+        # the main bottleneck. Results are written back in the original order.
+        completed = 0
+        with ThreadPoolExecutor(max_workers=max_workers) as executor:
+            future_to_index = {
+                executor.submit(download_file, item): index
+                for index, item in enumerate(records)
+            }
+            for future in as_completed(future_to_index):
+                index = future_to_index[future]
+                try:
+                    results[index] = future.result()
+                except Exception as exc:
+                    item = records[index]
+                    results[index] = {
+                        **item,
+                        "Status": "Failed",
+                        "Filename": "",
+                        "Error": str(exc),
+                        "Content": None,
+                    }
+                completed += 1
+                status.write(f"Downloaded {completed}/{len(records)} files")
+                progress.progress(completed / len(records))
 
         zip_bytes = create_zip(results, include_originals, include_merged, include_text)
         success = sum(r.get("Status") == "Success" for r in results)
         st.success(f"Completed: {success} successful, {len(results) - success} failed.")
         report = pd.DataFrame([{k: v for k, v in r.items() if k != "Content"} for r in results])
         st.dataframe(report, use_container_width=True, hide_index=True)
-        st.download_button("⬇️ Download One Master ZIP", zip_bytes, "all_downloads_master.zip", "application/zip")
+        st.download_button("⬇️ Download One Master ZIP", zip_bytes, "all_downloads_subject_book_extracted.zip", "application/zip")
 
 
 if __name__ == "__main__":
